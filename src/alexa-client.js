@@ -100,8 +100,8 @@ export class AlexaClient {
           proxyOwnIp: '127.0.0.1',
           proxyPort: 0,
           amazonPage: savedAuth.amazonPage || 'amazon.com',
-          acceptLanguage: 'es-MX',
-          amazonPageProxyLanguage: 'es_MX',
+          acceptLanguage: 'en-US',
+          amazonPageProxyLanguage: 'en_US',
           useWsMqtt: false,
           cookieRefreshInterval: 4 * 24 * 60 * 60 * 1000, // 4 days
         },
