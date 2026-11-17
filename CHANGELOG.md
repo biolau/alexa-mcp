@@ -11,6 +11,17 @@ Bitácora cronológica de cambios significativos en este proyecto.
 
 ---
 
+## 2026-11-17 — v1.2.0
+
+### Límite de tasa de Amazon: backoff, cooldown y caché de estado
+
+- `alexa_query_device` devolvía respuestas vacías (o colgaba) cuando Amazon contesta `Too many requests` (`UNOFFICIAL_CLIENT_TOO_MANY_REQUESTS`, no reintentable), y reintentar solo extendía el bloqueo.
+- `alexa-client.js`: se detecta el límite en la respuesta; hasta 2 reintentos dentro de la llamada (3 s y 10 s) y después un cooldown escalante (60 s → máx. 10 min) en el que no se toca Amazon y se responde con el último estado conocido.
+- Caché persistente `state-cache.json` junto a `auth.json` (escritura atómica): los dispositivos que Amazon deja sin respuesta —típico en Kasa/Hue, que solo reportan al cambiar— se sirven de la caché con `fromCache: true`.
+- Timeout de 25 s por solicitud: una petición colgada ya no cuelga la llamada MCP completa.
+- Nuevo parámetro `force: true` en `alexa_query_device` para saltar cooldown y caché.
+- Verificado con un stub de `alexa-remote2` (11 checks): respuesta parcial, cooldown sin llamadas, `force`, persistencia entre procesos.
+
 ## 2026-11-09 — v1.1.2
 
 ### Dependencias al día y vulnerabilidades corregidas

@@ -465,18 +465,26 @@ server.registerTool(
   {
     title: 'Query Smart Home Device',
     description:
-      'Query the current state of one or more smart home devices (on/off, brightness, temperature, etc).',
+      'Query the current state of one or more smart home devices (on/off, brightness, temperature, etc). ' +
+      'Amazon rate-limits state polling; when throttled the last known state is served from cache ' +
+      '(fromCache: true / throttled: true on the result). Keep queries few and small.',
     inputSchema: z.object({
       entityIds: z
         .array(z.string())
         .describe(
           'Array of smart home entity IDs to query (from alexa_list_smarthome_devices)'
         ),
+      force: z
+        .boolean()
+        .optional()
+        .describe(
+          'Bypass the rate-limit cooldown and cached state; always query Amazon live.'
+        ),
     }),
   },
-  async ({ entityIds }) => {
+  async ({ entityIds, force }) => {
     try {
-      const result = await client.querySmarthomeDevices(entityIds);
+      const result = await client.querySmarthomeDevices(entityIds, { force });
       return {
         content: [
           {

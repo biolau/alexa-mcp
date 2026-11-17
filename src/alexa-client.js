@@ -23,6 +23,27 @@ function resolveAuthDir() {
 
 const AUTH_DIR = resolveAuthDir();
 const AUTH_FILE = join(AUTH_DIR, 'auth.json');
+const STATE_CACHE_FILE = join(AUTH_DIR, 'state-cache.json');
+
+// Amazon rate-limits unofficial clients with "Too many requests"
+// (UNOFFICIAL_CLIENT_TOO_MANY_REQUESTS, isRetryable: false): fast retries only
+// extend the block. So: fail fast per request, retry a couple of times with a
+// wide gap, then cool down with an escalating window that serves the last
+// known state from disk instead of burning more quota.
+const QUERY_TIMEOUT_MS = 25_000;
+const THROTTLE_RETRY_DELAYS_MS = [3_000, 10_000];
+const COOLDOWN_BASE_MS = 60_000;
+const COOLDOWN_MAX_MS = 10 * 60_000;
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function isThrottled(result) {
+  if (!result || typeof result !== 'object') return false;
+  if (/too many requests/i.test(result.message || '')) return true;
+  return (result.errors || []).some(
+    (e) => /too many requests/i.test((e && e.message) || '')
+  );
+}
 
 /**
  * A registration is only usable if it carries everything alexa-remote2 needs
@@ -45,6 +66,9 @@ export class AlexaClient {
   constructor() {
     this.alexa = new Alexa();
     this.initialized = false;
+    this._throttleUntil = 0;
+    this._throttleHits = 0;
+    this._stateCache = null;
   }
 
   async init() {
@@ -168,41 +192,200 @@ export class AlexaClient {
     });
   }
 
-  async querySmarthomeDevices(entityIds) {
+  async querySmarthomeDevices(entityIds, { force = false } = {}) {
     await this.init();
+
+    // Cooldown after a recent throttle: answer from cache, do not touch Amazon
+    // again (the block is not instantly retryable, and every hammering call
+    // extends it).
+    if (!force && this._throttleUntil > Date.now()) {
+      return this._cachedOnly(entityIds, {
+        throttled: true,
+        message:
+          `Amazon is rate-limiting this client; next live query allowed after ` +
+          `${new Date(this._throttleUntil).toISOString()} (pass force: true to try anyway).`,
+      });
+    }
+
     const query = (ids, entityType) =>
       new Promise((resolve, reject) => {
+        // alexa-remote2 can hang on a stalled request; without this the whole
+        // MCP call hangs until the client gives up.
+        const timer = setTimeout(() => {
+          reject(new Error(`Smart home state query timed out after ${QUERY_TIMEOUT_MS / 1000}s`));
+        }, QUERY_TIMEOUT_MS);
         this.alexa.querySmarthomeDevices(
           ids.map((id) => ({ entityId: id, entityType })),
           (err, result) => {
+            clearTimeout(timer);
             if (err) return reject(err);
             resolve(result || {});
           }
         );
       });
 
+    let result = {};
+    let liveError = null;
+    for (let attempt = 0; ; attempt++) {
+      try {
+        result = await query(entityIds, 'APPLIANCE');
+        if (!isThrottled(result)) break;
+      } catch (err) {
+        liveError = err;
+        break;
+      }
+      if (attempt >= THROTTLE_RETRY_DELAYS_MS.length) break;
+      await sleep(THROTTLE_RETRY_DELAYS_MS[attempt]);
+    }
+
+    if (isThrottled(result)) {
+      this._throttleHits += 1;
+      const cooldown = Math.min(
+        COOLDOWN_BASE_MS * 2 ** (this._throttleHits - 1),
+        COOLDOWN_MAX_MS
+      );
+      this._throttleUntil = Date.now() + cooldown;
+      return this._cachedOnly(entityIds, {
+        throttled: true,
+        message:
+          `Amazon rate-limited this client (Too many requests). Cooling down ` +
+          `${Math.round(cooldown / 1000)}s; last known state below is served from cache.`,
+      });
+    }
+
+    if (liveError && !(result.deviceStates || []).length) {
+      return this._cachedOnly(entityIds, {
+        message: `Live query failed (${liveError.message}); last known state below is from cache.`,
+      });
+    }
+
+    this._throttleHits = 0;
+    this._throttleUntil = 0;
+
     // Echo-hosted endpoints (temperature sensors, acoustic sensors) are
     // components of the Echo device, and /api/phoenix/state only answers for
     // them with entityType ENTITY; plain appliances need APPLIANCE. Query as
     // APPLIANCE first, then retry whatever Amazon rejected as ENTITY.
-    const result = await query(entityIds, 'APPLIANCE');
     const missing = new Set(entityIds);
     for (const ds of result.deviceStates || []) {
       if (ds.entity && ds.entity.entityId) missing.delete(ds.entity.entityId);
     }
     if (missing.size) {
-      const retry = await query([...missing], 'ENTITY');
-      result.deviceStates = (result.deviceStates || []).concat(
-        retry.deviceStates || []
-      );
-      // TargetApplianceNotFoundException for the retried ids is now stale
-      result.errors = (result.errors || []).filter(
-        (e) => !(retry.deviceStates || []).some(
-          (ds) => ds.entity && e.entity && ds.entity.entityId === e.entity.entityId
-        )
-      );
+      try {
+        const retry = await query([...missing], 'ENTITY');
+        if (!isThrottled(retry)) {
+          result.deviceStates = (result.deviceStates || []).concat(
+            retry.deviceStates || []
+          );
+          // TargetApplianceNotFoundException for the retried ids is now stale
+          result.errors = (result.errors || []).filter(
+            (e) => !(retry.deviceStates || []).some(
+              (ds) => ds.entity && e.entity && ds.entity.entityId === e.entity.entityId
+            )
+          );
+          for (const ds of retry.deviceStates || []) {
+            if (ds.entity && ds.entity.entityId) missing.delete(ds.entity.entityId);
+          }
+        }
+      } catch {
+        // keep the APPLIANCE result; the cache fills the gaps below
+      }
+    }
+
+    this._recordStates(result.deviceStates);
+
+    // Amazon sometimes answers for only part of the batch — or for none of it,
+    // without any error — and Kasa/Hue devices only push state on change.
+    // Serve whatever is still missing from cache instead of an empty success.
+    if (missing.size) {
+      const cache = this._loadStateCache();
+      const stale = [];
+      for (const id of missing) {
+        if (cache[id]) {
+          stale.push({ ...cache[id], fromCache: true });
+          missing.delete(id);
+        }
+      }
+      if (stale.length) {
+        result.deviceStates = (result.deviceStates || []).concat(stale);
+      }
+      result.partial = {
+        message: stale.length
+          ? 'Some devices were served from cached state (Amazon answered empty for them).'
+          : 'Amazon answered empty for these devices and no cached state exists yet.',
+        cachedCount: stale.length,
+        missingEntityIds: [...missing],
+      };
     }
     return result;
+  }
+
+  _cachedOnly(entityIds, extra = {}) {
+    const cache = this._loadStateCache();
+    const deviceStates = [];
+    const missingEntityIds = [];
+    for (const id of entityIds) {
+      if (cache[id]) deviceStates.push({ ...cache[id], fromCache: true });
+      else missingEntityIds.push(id);
+    }
+    return {
+      deviceStates,
+      ...(extra.throttled ? { throttled: true } : {}),
+      ...(extra.message ? { message: extra.message } : {}),
+      ...(missingEntityIds.length
+        ? {
+            partial: {
+              message: 'No cached state for these devices yet.',
+              missingEntityIds,
+            },
+          }
+        : {}),
+    };
+  }
+
+  _loadStateCache() {
+    if (!this._stateCache) {
+      try {
+        this._stateCache =
+          JSON.parse(readFileSync(STATE_CACHE_FILE, 'utf8')).devices || {};
+      } catch {
+        this._stateCache = {};
+      }
+    }
+    return this._stateCache;
+  }
+
+  _recordStates(deviceStates) {
+    if (!deviceStates || !deviceStates.length) return;
+    const cache = this._loadStateCache();
+    let changed = false;
+    for (const ds of deviceStates) {
+      if (
+        ds &&
+        ds.entity &&
+        ds.entity.entityId &&
+        !ds.fromCache &&
+        Array.isArray(ds.capabilityStates) &&
+        ds.capabilityStates.length
+      ) {
+        cache[ds.entity.entityId] = ds;
+        changed = true;
+      }
+    }
+    if (!changed) return;
+    try {
+      // Atomic write, same pattern as _saveAuth: a crash must not leave a
+      // truncated cache behind.
+      const tmp = `${STATE_CACHE_FILE}.tmp`;
+      writeFileSync(
+        tmp,
+        JSON.stringify({ updatedAt: new Date().toISOString(), devices: cache }, null, 2),
+        'utf8'
+      );
+      renameSync(tmp, STATE_CACHE_FILE);
+    } catch {
+      // best-effort: the in-memory copy still serves this process
+    }
   }
 
   // --- Announcements ---
