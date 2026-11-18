@@ -13,6 +13,7 @@ import { writeFileSync, mkdirSync, existsSync, chmodSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { homedir } from 'os';
+import { execFileSync } from 'child_process';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -27,12 +28,46 @@ function resolveAuthDir() {
 const AUTH_DIR = resolveAuthDir();
 const AUTH_FILE = join(AUTH_DIR, 'auth.json');
 
+// auth.json holds a live Amazon session, so it must be readable only by this
+// user. Two things defeat that on Windows: Node's chmod only toggles the
+// read-only bit (it cannot express owner-only), and a new file inherits the
+// volume's ACEs — on a typical box that is `Users: ReadAndExecute` and
+// `Authenticated Users: Modify`, i.e. every local account could read the
+// cookie. So on win32 strip the inherited ACEs and grant only the current
+// user; everywhere else keep the usual 0600 chmod.
+function hardenSecret(target) {
+  if (process.platform === 'win32') {
+    try {
+      const me = execFileSync('whoami', [], { encoding: 'utf8' }).trim();
+      execFileSync('icacls', [target, '/inheritance:r', '/grant:r', `${me}:F`], {
+        stdio: 'pipe',
+      });
+      return;
+    } catch (e) {
+      console.log(`(warning) could not tighten NTFS ACL on ${target}: ${e.message}`);
+      return;
+    }
+  }
+  try {
+    chmodSync(target, 0o600);
+  } catch (e) {
+    console.log(`(warning) chmod 600 failed on ${target}: ${e.message}`);
+  }
+}
+
 if (!existsSync(AUTH_DIR)) {
   mkdirSync(AUTH_DIR, { recursive: true });
 }
+hardenSecret(AUTH_DIR);
 
 const alexa = new Alexa();
 const PROXY_PORT = 3457;
+
+// The auth proxy sits in front of amazon.com and carries the login, cookies
+// included, for the whole flow. Binding it to every interface exposes it to
+// anything on the LAN for that window, so bind loopback by default and let
+// anyone who really wants a LAN proxy opt in explicitly.
+const PROXY_BIND = process.env.ALEXA_AUTH_PROXY_BIND || '127.0.0.1';
 
 console.log('');
 console.log('=== Alexa MCP Server - Autenticacion ===');
@@ -44,7 +79,7 @@ alexa.init(
     proxyOnly: true,
     proxyOwnIp: 'localhost',
     proxyPort: PROXY_PORT,
-    proxyListenBind: '0.0.0.0',
+    proxyListenBind: PROXY_BIND,
     amazonPage: 'amazon.com',
     acceptLanguage: 'en-US',
     amazonPageProxyLanguage: 'en_US',
@@ -83,7 +118,7 @@ alexa.init(
           authenticatedAt: new Date().toISOString(),
         };
         writeFileSync(AUTH_FILE, JSON.stringify(authData, null, 2), 'utf8');
-        chmodSync(AUTH_FILE, 0o600);
+        hardenSecret(AUTH_FILE);
         console.log('');
         console.log(`Advertencia post-auth: ${msg}`);
         console.log('Cookie capturada y guardada de todos modos.');
@@ -106,7 +141,7 @@ alexa.init(
     };
 
     writeFileSync(AUTH_FILE, JSON.stringify(authData, null, 2), 'utf8');
-    chmodSync(AUTH_FILE, 0o600);
+    hardenSecret(AUTH_FILE);
 
     console.log('');
     console.log('Autenticacion exitosa!');
